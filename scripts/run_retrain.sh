@@ -14,4 +14,4 @@ python -m neuralce.training.retrain \
     --config ./configs/tuning/stfo_wo_spin.yaml \
     --checkpoint ./best_stfo_wo_spin_ising_lite.pkl \
     --epochs 5000 \
-    --output ./best_pkl/retrained/retrained_stfo_wo_spin_ising_lite_2.pkl
+    --output ./best_pkl/retrained/retrained_stfo_wo_spin_ising_lite_3.pkl

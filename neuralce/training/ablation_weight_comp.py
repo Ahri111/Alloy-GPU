@@ -1,31 +1,6 @@
 """
-ablation.py — 5-Model Lite Ablation + Optuna HP Search
-JAX/Flax. Works for any fixed-lattice system (perovskites, alloys, etc.)
-
-Models (Lite — one-hot node + shell edge):
-  0. ising_lite              — No spin (baseline)
-  1. neuralce_evenodd_lite   — Product backbone + EvenOdd (main)
-  2. neuralce_sisj_lite      — Product backbone + σᵢσⱼ edge
-  3. gnn_sisj_lite           — Concat-MLP backbone + σᵢσⱼ edge
-  4. gnn_evenodd_lite        — Concat-MLP backbone + EvenOdd
-
-Ablation table:
-  ┌─────────────┬──────────────────────┬──────────────────────┐
-  │             │ EvenOdd              │ SiSj (σᵢσⱼ edge)    │
-  ├─────────────┼──────────────────────┼──────────────────────┤
-  │ Product(CE) │ neuralce_evenodd_lite│ neuralce_sisj_lite   │
-  │ Concat-MLP  │ gnn_evenodd_lite     │ gnn_sisj_lite        │
-  └─────────────┴──────────────────────┴──────────────────────┘
-  + ising_lite (no spin baseline)
-
-Graph construction:
-  If config contains graph.shell_edges, uses gap-based boundaries from
-  analyze_cutoffs.py (recommended). Otherwise falls back to linspace.
-
-Usage:
-  Set CONFIG_PATH env var or edit below to point to your YAML config.
-  Run: python ablation.py
-  Or:  CONFIG_PATH=./configs/my_system.yaml python ablation.py
+ablation_weight_comp.py — Per-Composition Weighted MSE + Optuna HP Search
+ablation_comp.py 기반, target_comp의 loss weight를 Optuna로 탐색.
 """
 
 import os, time, pickle, json, copy, random as pyrandom, re
@@ -54,7 +29,7 @@ from neuralce.models.NeuralCE_jax import (create_neuralce, is_spin_model, is_sis
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CONFIG — yaml 경로만 바꾸면 됨
+# CONFIG
 # ═══════════════════════════════════════════════════════════════════════
 CONFIG_PATH = os.environ.get('CONFIG_PATH', './configs/stfo_spin_ablation.yaml')
 
@@ -62,13 +37,11 @@ import yaml
 with open(CONFIG_PATH) as f:
     _cfg = yaml.safe_load(f)
 
-# Mode check
 _mode = _cfg.get('mode', 'ablation')
 if _mode != 'ablation':
     raise ValueError(f"This script requires mode: ablation, got '{_mode}'. "
                      f"Use pt_mcmc.py for mode: pt_mcmc.")
 
-# Common: dataset
 DATASET_NAME = _cfg['dataset_name']
 CIF_DIR      = _cfg['cif_dir']
 DETAILED_CSV = _cfg['csv_path']
@@ -77,25 +50,17 @@ ID_COL       = _cfg.get('id_col', 'cif_id')
 COMP_REGEX   = _cfg.get('comp_regex', r'_(\d+)')
 SPECIES_MAP  = {int(k): v for k, v in _cfg['species_map'].items()}
 N_SPECIES    = len(SPECIES_MAP)
-N_ATOMS      = _cfg['n_atoms']              # will be overwritten if exclude_species
-N_ATOMS_ORIG = _cfg['n_atoms']              # original count for per-atom metrics
+N_ATOMS      = _cfg['n_atoms']
+N_ATOMS_ORIG = _cfg['n_atoms']
 HAS_SPIN     = _cfg.get('has_spin', False)
 
-# Species exclusion: remove constant-site atoms from graph
-# e.g. exclude_species: [38]  removes Sr (Z=38) from STFO
 EXCLUDE_Z    = set(_cfg.get('exclude_species', []))
 
-# Graph config (from analyze_cutoffs.py or manual)
-# Two modes:
-#   (A) Single fixed cutoff:  graph.cutoff + graph.shell_edges
-#   (B) Multiple candidates:  graph.candidates: {cutoff: {n_shells, shell_edges}, ...}
-#   (C) Neither set:          Optuna searches cutoff/n_shells with linspace
 _graph       = _cfg.get('graph', {})
 GRAPH_MAX_NUM_NBR = _graph.get('max_num_nbr', 12)
 
 _candidates = _graph.get('candidates', None)
 if _candidates is not None:
-    # Mode B: multiple cutoff candidates for Optuna to choose from
     GRAPH_CANDIDATES = {}
     for cut_str, info in _candidates.items():
         cut = float(cut_str)
@@ -107,7 +72,6 @@ if _candidates is not None:
     print(f"Graph config: {len(GRAPH_CANDIDATES)} cutoff candidates "
           f"{sorted(GRAPH_CANDIDATES.keys())} (Optuna will choose)")
 elif _graph.get('cutoff') is not None:
-    # Mode A: single fixed cutoff
     GRAPH_CANDIDATES = {
         _graph['cutoff']: {
             'n_shells': _graph['n_shells'],
@@ -118,12 +82,10 @@ elif _graph.get('cutoff') is not None:
     print(f"Graph config: fixed cutoff={_graph['cutoff']}, "
           f"n_shells={_graph['n_shells']}, shell_edges={_graph.get('shell_edges')}")
 else:
-    # Mode C: Optuna searches everything
     GRAPH_CANDIDATES = None
     GRAPH_MODE = 'search'
     print(f"Graph config: not set → Optuna will search cutoff/n_shells")
 
-# Ablation-specific
 _abl         = _cfg.get('ablation', {})
 SEED         = _abl.get('seed', 42)
 VAL_FRAC     = _abl.get('val_frac', 0.15)
@@ -135,18 +97,24 @@ N_TRIALS     = _abl.get('n_trials', 30)
 OPTUNA_TIMEOUT = _abl.get('optuna_timeout', None)
 OUTPUT_DIR     = _abl.get('output_dir', '.')
 
-# Search space from config (with defaults)
 _ss = _abl.get('search_space', {})
 SS_ATOM_FEA_LEN = _ss.get('atom_fea_len', [8, 16, 24, 32, 48])
-SS_N_CONV       = _ss.get('n_conv', [2, 5])           # [min, max]
+SS_N_CONV       = _ss.get('n_conv', [2, 5])
 SS_H_FEA_LEN    = _ss.get('h_fea_len', [16, 32, 64, 128])
-SS_LR           = _ss.get('lr', [1.0e-4, 5.0e-3])     # [min, max] log scale
+SS_LR           = _ss.get('lr', [1.0e-4, 5.0e-3])
 SS_ODD_FEA_LEN  = _ss.get('odd_fea_len', [1, 2, 4, 8, 16])
+
+TARGET_COMPS       = set(_abl.get('target_comp', []))
+COMP_WEIGHT_RANGE  = _abl.get('comp_weight_range', [1.0, 50.0])
+TARGET_ONLY_METRIC = _abl.get('target_only_metric', False)
 
 print(f"Search space: atom_fea_len={SS_ATOM_FEA_LEN}, n_conv={SS_N_CONV}, "
       f"h_fea_len={SS_H_FEA_LEN}, lr={SS_LR}")
 print(f"Training: max_epochs={MAX_EPOCHS}, patience={PATIENCE}, "
       f"n_trials={N_TRIALS}, batch_size={BATCH_SIZE}")
+if TARGET_COMPS:
+    print(f"Target comps: {sorted(TARGET_COMPS)}, weight_range={COMP_WEIGHT_RANGE}, "
+          f"target_only_metric={TARGET_ONLY_METRIC}")
 
 RUN_MODELS   = _abl.get('run_models', [
     'ising_lite',
@@ -156,7 +124,6 @@ RUN_MODELS   = _abl.get('run_models', [
     'gnn_evenodd_lite',
 ])
 
-# Auto-filter: spin 없으면 spin 모델 자동 제외
 if not HAS_SPIN:
     _before = len(RUN_MODELS)
     RUN_MODELS = [m for m in RUN_MODELS if not is_spin_model(m)]
@@ -172,39 +139,21 @@ if not HAS_SPIN:
 
 def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex,
               exclude_z=None):
-    """Load dataset → list of dicts.
-    
-    spin_pkl_path=None → all spins zero.
-    exclude_z: set of atomic numbers to remove from graph (e.g. {38} for Sr).
-               Energy target is unchanged — the excluded atoms are structurally
-               constant and their contribution is absorbed into the learned bias.
-    """
     if exclude_z is None:
         exclude_z = set()
 
     df = pd.read_csv(csv_path)
     if id_col not in df.columns:
-        # fallback: try both common names
         id_col = 'id' if 'id' in df.columns else 'cif_id'
     energy_map = dict(zip(df[id_col].astype(str), df['total_energy'].values))
 
-    # Spin: try (1) spin_pkl, (2) CSV 'spins' column, (3) zeros
-    spin_map = {}
     if spin_pkl_path and os.path.exists(spin_pkl_path):
         spin_df = pd.read_pickle(spin_pkl_path)
         spin_map = dict(zip(spin_df['cif_id'].astype(str),
                             spin_df['spin_states'].values))
-        print(f"  Spin data loaded from PKL: {len(spin_map)} entries")
-    elif 'spins' in df.columns:
-        import json as _json
-        for _, row in df.iterrows():
-            sid = str(row[id_col])
-            try:
-                spin_map[sid] = _json.loads(row['spins'])
-            except (ValueError, TypeError):
-                pass
-        print(f"  Spin data loaded from CSV: {len(spin_map)} entries")
+        print(f"  Spin data loaded: {len(spin_map)} entries")
     else:
+        spin_map = {}
         print(f"  No spin data → all spins set to 0")
 
     structures = []
@@ -221,7 +170,6 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex,
         spins = spin_map.get(cif_id, [0] * len(crystal))
         spins = np.array(spins, dtype=np.float32)
 
-        # --- Filter excluded species ---
         if exclude_z:
             keep_idx = [i for i, site in enumerate(crystal)
                         if site.specie.Z not in exclude_z]
@@ -240,7 +188,7 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex,
 
     print(f"Loaded {len(structures)} structures ({n_skip} skipped)")
     if exclude_z:
-        z_names = {38: 'Sr', 56: 'Ba', 20: 'Ca', 39: 'Y'}  # common A-site
+        z_names = {38: 'Sr', 56: 'Ba', 20: 'Ca', 39: 'Y'}
         excluded = [z_names.get(z, f'Z={z}') for z in sorted(exclude_z)]
         print(f"  Excluded species: {excluded}")
         n_at_set = set(s['n_atoms'] for s in structures)
@@ -258,28 +206,16 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex,
 
 def build_graph_lite(struct, cutoff, n_shells, max_num_nbr=12, include_sisj=False,
                      shell_edges=None):
-    """Build graph from pymatgen Structure.
-    
-    Node:  [Ti, Fe, O, Vo] one-hot (4-dim), Sr→zeros
-    Edge:  shell one-hot (n_shells-dim)
-           if include_sisj: append σᵢσⱼ → (n_shells+1)-dim
-    Spin:  (n_atoms, 1) scalar
-
-    shell_edges: if provided, use these boundaries for shell assignment
-                 (from analyze_cutoffs.py). Otherwise linspace fallback.
-    """
     crystal = struct['crystal']
     n_at = len(crystal)
     spins = struct['spin_states']
 
-    # Node features
     atom_fea = np.zeros((n_at, N_SPECIES), dtype=np.float32)
     for i, site in enumerate(crystal):
         z = site.specie.Z
         if z in SPECIES_MAP:
             atom_fea[i, SPECIES_MAP[z]] = 1.0
 
-    # Neighbor search
     all_nbrs = crystal.get_all_neighbors(cutoff, include_index=True)
     all_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in all_nbrs]
 
@@ -292,13 +228,10 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr=12, include_sisj=Fals
             nbr_fea_idx[i, j] = nbr[j][2]
             nbr_dists[i, j]   = nbr[j][1]
 
-    # Shell one-hot
     valid_mask = nbr_dists < cutoff
     if shell_edges is not None:
-        # Gap-based boundaries from analyze_cutoffs.py
         _edges = np.array(shell_edges)
     else:
-        # Fallback: linspace (legacy behavior)
         min_dist = nbr_dists[valid_mask].min() if valid_mask.any() else 0.1
         _edges = np.linspace(min_dist * 0.99, cutoff, n_shells + 1)
 
@@ -310,17 +243,15 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr=12, include_sisj=Fals
             if nbr_dists[i, j] < cutoff:
                 shell_oh[i, j, shell_idx[i, j]] = 1.0
 
-    # Edge features
     if include_sisj:
-        # σᵢσⱼ for each edge
         sisj = np.zeros((n_at, max_num_nbr, 1), dtype=np.float32)
         for i in range(n_at):
             for j in range(max_num_nbr):
                 if nbr_dists[i, j] < cutoff:
                     sisj[i, j, 0] = spins[i] * spins[nbr_fea_idx[i, j]]
-        nbr_fea = np.concatenate([shell_oh, sisj], axis=-1)  # (n_at, M, n_shells+1)
+        nbr_fea = np.concatenate([shell_oh, sisj], axis=-1)
     else:
-        nbr_fea = shell_oh  # (n_at, M, n_shells)
+        nbr_fea = shell_oh
 
     spin_fea = spins[:n_at].reshape(-1, 1).astype(np.float32)
     return atom_fea, nbr_fea, nbr_fea_idx, spin_fea
@@ -328,7 +259,6 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr=12, include_sisj=Fals
 
 def build_all_graphs(structures, cutoff, n_shells, max_num_nbr=12,
                      include_sisj=False, shell_edges=None):
-    """Build and batch all graphs."""
     lists = {'atom_fea': [], 'nbr_fea': [], 'nbr_fea_idx': [],
              'spin_fea': [], 'energies': [], 'comps': []}
 
@@ -358,7 +288,6 @@ def build_all_graphs(structures, cutoff, n_shells, max_num_nbr=12,
 # ═══════════════════════════════════════════════════════════════════════
 
 def create_model(model_name, hp):
-    """Create Lite model from HP dict."""
     sisj = is_sisj_model(model_name)
     n_shells = hp['n_shells']
     edge_dim = n_shells + 1 if sisj else n_shells
@@ -381,7 +310,6 @@ def create_model(model_name, hp):
 # ═══════════════════════════════════════════════════════════════════════
 
 def init_train_state(model, hp, rng_key, dataset, model_name):
-    """Initialize model params + optimizer."""
     use_spin = is_spin_model(model_name)
     dummy_af  = dataset['atom_fea'][0]
     dummy_nf  = dataset['nbr_fea'][0]
@@ -407,7 +335,6 @@ def init_train_state(model, hp, rng_key, dataset, model_name):
 
 
 def _forward(state, af, nf, nfi, sf, use_spin):
-    """Flat forward for a batch."""
     B = af.shape[0]
     af_flat = af.reshape(-1, af.shape[-1])
     offsets = jnp.arange(B)[:, None, None] * N_ATOMS
@@ -423,7 +350,7 @@ def _forward(state, af, nf, nfi, sf, use_spin):
 
 
 def loss_fn(params, state, batch, use_spin):
-    af, nf, nfi, sf, targets = batch
+    af, nf, nfi, sf, targets, weights = batch
     B = af.shape[0]
     af_flat = af.reshape(-1, af.shape[-1])
     offsets = jnp.arange(B)[:, None, None] * N_ATOMS
@@ -436,7 +363,7 @@ def loss_fn(params, state, batch, use_spin):
         kw['atom_spins'] = sf.reshape(-1, sf.shape[-1])
 
     pred = state.apply_fn(params, **kw).squeeze(-1)
-    return jnp.mean((pred - targets) ** 2)
+    return jnp.mean(weights * (pred - targets) ** 2)
 
 
 @jax.jit
@@ -452,8 +379,8 @@ def train_step_nospin(state, batch):
     return state.apply_gradients(grads=grads), loss
 
 
-def eval_epoch(state, dataset, indices, use_spin):
-    """Evaluate on a subset."""
+def eval_epoch(state, dataset, indices, use_spin, return_per_comp_srcc=False,
+               filter_comps=None):
     all_preds, all_targets = [], []
     total_loss, n_total = 0.0, 0
 
@@ -473,20 +400,50 @@ def eval_epoch(state, dataset, indices, use_spin):
         all_preds.append(np.array(pred))
         all_targets.append(np.array(targets))
 
-    return total_loss / max(n_total, 1), np.concatenate(all_preds), np.concatenate(all_targets)
+    val_loss = total_loss / max(n_total, 1)
+    preds = np.concatenate(all_preds)
+    targets = np.concatenate(all_targets)
+
+    if not return_per_comp_srcc:
+        return val_loss, preds, targets
+
+    comps = [dataset['comps'][i] for i in indices]
+    comp_srccs = []
+    for c in sorted(set(comps)):
+        if filter_comps is not None and c not in filter_comps:
+            continue
+        mask = [i for i, cc in enumerate(comps) if cc == c]
+        if len(mask) >= 3:
+            rho = spearmanr(targets[mask], preds[mask]).correlation
+            if not np.isnan(rho):
+                comp_srccs.append(rho)
+    mean_comp_srcc = np.mean(comp_srccs) if comp_srccs else 0.0
+
+    return val_loss, preds, targets, mean_comp_srcc
 
 
 def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
-    """Full training loop."""
     use_spin = is_spin_model(model_name)
     model = create_model(model_name, hp)
     rng = jax.random.PRNGKey(SEED)
     state = init_train_state(model, hp, rng, dataset, model_name)
     n_params = sum(p.size for p in jax.tree.leaves(state.params))
 
+    comp_weight = hp.get('comp_weight', 1.0)
+    comps = dataset['comps']
+    all_weights = np.ones(len(comps), dtype=np.float32)
+    if TARGET_COMPS:
+        for i in range(len(comps)):
+            if comps[i] in TARGET_COMPS:
+                all_weights[i] = comp_weight
+    dataset_weights = jnp.array(all_weights)
+
+    metric_filter = TARGET_COMPS if (TARGET_ONLY_METRIC and TARGET_COMPS) else None
+
     step_fn = train_step_spin if use_spin else train_step_nospin
 
-    best_val = float('inf')
+    best_score = -float('inf')
+    best_val_mse = float('inf')
     best_params = None
     patience_ctr = 0
     best_epoch = 0
@@ -502,16 +459,19 @@ def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
                 continue
             batch = (dataset['atom_fea'][idx], dataset['nbr_fea'][idx],
                      dataset['nbr_fea_idx'][idx], dataset['spin_fea'][idx],
-                     dataset['energies'][idx])
+                     dataset['energies'][idx], dataset_weights[idx])
             state, loss = step_fn(state, batch)
             epoch_loss += float(loss)
             n_bat += 1
         epoch_loss /= max(n_bat, 1)
 
-        val_loss, _, _ = eval_epoch(state, dataset, val_idx, use_spin)
+        val_loss, _, _, mean_comp_srcc = eval_epoch(
+            state, dataset, val_idx, use_spin,
+            return_per_comp_srcc=True, filter_comps=metric_filter)
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if mean_comp_srcc > best_score:
+            best_score = mean_comp_srcc
+            best_val_mse = val_loss
             best_params = copy.deepcopy(state.params)
             patience_ctr = 0
             best_epoch = epoch
@@ -522,14 +482,15 @@ def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
             break
 
         if trial is not None and HAS_OPTUNA:
-            trial.report(val_loss, epoch)
+            trial.report(-mean_comp_srcc, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
         if epoch % 500 == 0:
-            print(f"    [epoch {epoch:5d}] train={epoch_loss:.6f} val={val_loss:.6f}")
+            print(f"    [epoch {epoch:5d}] train_MSE={epoch_loss:.6f} "
+                  f"val_MSE={val_loss:.6f} mean_comp_SRCC={mean_comp_srcc:.4f}")
 
-    return best_val, best_params, best_epoch, n_params
+    return -best_score, best_params, best_epoch, n_params, best_val_mse
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -543,7 +504,12 @@ def make_objective(model_name, structures, graph_cache, train_idx, val_idx):
         h_fea_len    = trial.suggest_categorical('h_fea_len', SS_H_FEA_LEN)
         lr           = trial.suggest_float('lr', SS_LR[0], SS_LR[1], log=True)
 
-        # Graph params: 3 modes
+        if TARGET_COMPS:
+            comp_weight = trial.suggest_float(
+                'comp_weight', COMP_WEIGHT_RANGE[0], COMP_WEIGHT_RANGE[1], log=True)
+        else:
+            comp_weight = 1.0
+
         if GRAPH_MODE == 'candidates':
             cutoff_keys = sorted(GRAPH_CANDIDATES.keys())
             cutoff = trial.suggest_categorical('cutoff', cutoff_keys)
@@ -557,7 +523,7 @@ def make_objective(model_name, structures, graph_cache, train_idx, val_idx):
             n_shells    = info['n_shells']
             shell_edges = info['shell_edges']
             max_num_nbr = GRAPH_MAX_NUM_NBR
-        else:  # 'search'
+        else:
             cutoff      = trial.suggest_float('cutoff', 3.0, 7.0, step=0.5)
             n_shells    = trial.suggest_int('n_shells', 2, 6)
             max_num_nbr = trial.suggest_categorical('max_num_nbr', [8, 12, 16])
@@ -568,6 +534,7 @@ def make_objective(model_name, structures, graph_cache, train_idx, val_idx):
             'h_fea_len': h_fea_len, 'lr': lr,
             'cutoff': cutoff, 'n_shells': n_shells,
             'max_num_nbr': max_num_nbr,
+            'comp_weight': comp_weight,
         }
         if is_spin_model(model_name):
             hp['odd_fea_len'] = trial.suggest_categorical('odd_fea_len', SS_ODD_FEA_LEN)
@@ -584,16 +551,19 @@ def make_objective(model_name, structures, graph_cache, train_idx, val_idx):
         dataset = graph_cache[cache_key]
 
         print(f"  Trial {trial.number}: {hp}")
-        best_val, best_params, best_epoch, n_params = train_model(
+        neg_srcc, best_params, best_epoch, n_params, best_val_mse = train_model(
             model_name, hp, dataset, train_idx, val_idx, trial=trial)
 
         trial.set_user_attr('best_params', best_params)
         trial.set_user_attr('best_epoch', best_epoch)
         trial.set_user_attr('n_params', n_params)
         trial.set_user_attr('hp', hp)
+        trial.set_user_attr('val_mse', best_val_mse)
 
-        print(f"    → val_MSE={best_val:.6f} @ epoch {best_epoch} | params={n_params:,}")
-        return best_val
+        mean_srcc = -neg_srcc
+        print(f"    → mean_comp_SRCC={mean_srcc:.4f} (val_MSE={best_val_mse:.6f}) "
+              f"@ epoch {best_epoch} | params={n_params:,}")
+        return neg_srcc
     return objective
 
 
@@ -635,7 +605,6 @@ def main():
     structures = load_data(CIF_DIR, DETAILED_CSV, SPIN_PKL, ID_COL, COMP_REGEX,
                            exclude_z=EXCLUDE_Z)
 
-    # Recompute N_ATOMS after exclusion (must be uniform for FixedPool)
     n_atoms_set = set(s['n_atoms'] for s in structures)
     if len(n_atoms_set) != 1:
         raise ValueError(
@@ -673,11 +642,12 @@ def main():
             best_params = bt.user_attrs['best_params']
             best_epoch  = bt.user_attrs['best_epoch']
             n_params    = bt.user_attrs['n_params']
-            best_val    = bt.value
+            best_val_mse = bt.user_attrs.get('val_mse', float('nan'))
+            best_mean_srcc = -bt.value
             print(f"\n  Best: {best_hp}")
-            print(f"  val_MSE={best_val:.6f} @ epoch {best_epoch} | params={n_params:,}")
+            print(f"  mean_comp_SRCC={best_mean_srcc:.4f} (val_MSE={best_val_mse:.6f}) "
+                  f"@ epoch {best_epoch} | params={n_params:,}")
         else:
-            # Single run with default HP — use first candidate if available
             if GRAPH_CANDIDATES:
                 _first_cut = sorted(GRAPH_CANDIDATES.keys())[0]
                 _first_info = GRAPH_CANDIDATES[_first_cut]
@@ -695,6 +665,7 @@ def main():
                 'cutoff': _def_cutoff,
                 'n_shells': _def_nshells,
                 'max_num_nbr': GRAPH_MAX_NUM_NBR,
+                'comp_weight': 1.0,
             }
             sisj = is_sisj_model(model_name)
             ck = (best_hp['cutoff'], best_hp['n_shells'], best_hp['max_num_nbr'], sisj)
@@ -706,15 +677,15 @@ def main():
             dataset = graph_cache[ck]
 
             print(f"  Single run: {best_hp}")
-            best_val, best_params, best_epoch, n_params = train_model(
+            neg_srcc, best_params, best_epoch, n_params, best_val_mse = train_model(
                 model_name, best_hp, dataset, train_idx, val_idx)
-            print(f"  val_MSE={best_val:.6f} @ epoch {best_epoch} | params={n_params:,}")
+            best_mean_srcc = -neg_srcc
+            print(f"  mean_comp_SRCC={best_mean_srcc:.4f} (val_MSE={best_val_mse:.6f}) "
+                  f"@ epoch {best_epoch} | params={n_params:,}")
 
-        # --- Test evaluation ---
         sisj = is_sisj_model(model_name)
         ck = (best_hp['cutoff'], best_hp['n_shells'], best_hp['max_num_nbr'], sisj)
         if ck not in graph_cache:
-            # Resolve shell_edges for this cutoff
             _se = None
             if GRAPH_CANDIDATES and best_hp['cutoff'] in GRAPH_CANDIDATES:
                 _se = GRAPH_CANDIDATES[best_hp['cutoff']]['shell_edges']
@@ -744,10 +715,17 @@ def main():
             print(f"  Per-comp SRCC:")
             for c, s in sorted(metrics_pa['srcc_per_comp'].items()):
                 print(f"    x={c/1000:.3f}: {s:.4f}")
+        if TARGET_COMPS:
+            target_srccs = {c: v for c, v in metrics_pa['srcc_per_comp'].items()
+                            if c in TARGET_COMPS}
+            if target_srccs:
+                mean_target_srcc = np.mean(list(target_srccs.values()))
+                print(f"  Target comp SRCC (mean): {mean_target_srcc:.4f}")
 
         all_results.append({
             'name': model_name, 'hp': best_hp, 'n_params': n_params,
-            'val_mse': best_val, 'best_epoch': best_epoch,
+            'val_mse': best_val_mse, 'val_mean_comp_srcc': best_mean_srcc,
+            'best_epoch': best_epoch,
             'test_targets': targets_test, 'test_preds': preds_test,
             'test_metrics': metrics, 'test_metrics_pa': metrics_pa,
         })
@@ -755,11 +733,9 @@ def main():
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         ckpt_path = os.path.join(OUTPUT_DIR, f'best_{DATASET_NAME}_{model_name}.pkl')
         with open(ckpt_path, 'wb') as f:
-            pickle.dump({'params': best_params, 'hp': best_hp,
-                         'model_name': model_name}, f)
+            pickle.dump({'params': best_params, 'hp': best_hp}, f)
         print(f"  Saved → {ckpt_path}")
 
-    # --- Summary ---
     ROLES = {
         'ising_lite':              'No spin baseline',
         'neuralce_evenodd_lite':   'Product+EvenOdd (main)',
@@ -773,15 +749,17 @@ def main():
     print(f"  graph atoms={N_ATOMS}  orig atoms={N_ATOMS_ORIG}")
     print(f"{'='*70}")
     print(f"{'#':<3} {'Model':<26} {'Role':<24} {'Params':>7} "
-          f"{'RMSE(eV/at)':>12} {'MAE(eV/at)':>12} {'SRCC':>7}")
-    print(f"{'-'*3} {'-'*26} {'-'*24} {'-'*7} {'-'*12} {'-'*12} {'-'*7}")
+          f"{'RMSE(eV/at)':>12} {'MAE(eV/at)':>12} {'SRCC':>7} {'CompSRCC':>8}")
+    print(f"{'-'*3} {'-'*26} {'-'*24} {'-'*7} {'-'*12} {'-'*12} {'-'*7} {'-'*8}")
     for i, r in enumerate(all_results):
         m = r['test_metrics_pa']
         role = ROLES.get(r['name'], '')
+        comp_vals = list(m['srcc_per_comp'].values())
+        test_comp_srcc = np.mean(comp_vals) if comp_vals else float('nan')
         print(f"{i:<3} {r['name']:<26} {role:<24} {r['n_params']:>7,} "
-              f"{m['rmse']:>12.6f} {m['mae']:>12.6f} {m['srcc_global']:>7.4f}")
+              f"{m['rmse']:>12.6f} {m['mae']:>12.6f} {m['srcc_global']:>7.4f} "
+              f"{test_comp_srcc:>8.4f}")
 
-    # --- Save ---
     meta = {
         'dataset': DATASET_NAME, 'has_spin': HAS_SPIN,
         'exclude_species': sorted(EXCLUDE_Z),
@@ -790,6 +768,8 @@ def main():
         'graph_candidates': {str(k): v for k, v in GRAPH_CANDIDATES.items()}
             if GRAPH_CANDIDATES else None,
         'max_num_nbr': GRAPH_MAX_NUM_NBR,
+        'target_comps': sorted(TARGET_COMPS),
+        'target_only_metric': TARGET_ONLY_METRIC,
     }
     log = []
     for r in all_results:
@@ -807,7 +787,7 @@ def main():
         suffix = '_no' + '_'.join(z_names.get(z, f'Z{z}') for z in sorted(EXCLUDE_Z))
     else:
         suffix = ''
-    outname = os.path.join(OUTPUT_DIR, f'ablation_{DATASET_NAME}{suffix}_results.json')
+    outname = os.path.join(OUTPUT_DIR, f'ablation_{DATASET_NAME}{suffix}_weightcomp_results.json')
     with open(outname, 'w') as f:
         json.dump({'meta': meta, 'results': log}, f, indent=2, default=str)
     print(f"\nSaved → {outname}")

@@ -391,7 +391,7 @@ def init_train_state(model, hp, rng_key, dataset, model_name):
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=lr * 0.1, peak_value=lr,
         warmup_steps=50, decay_steps=MAX_EPOCHS, end_value=lr * 0.01)
-    optimizer = optax.chain(optax.clip_by_global_norm(5.0), optax.adam(schedule))
+    optimizer = optax.chain(optax.clip_by_global_norm(5.0), optax.adamw(schedule))
 
     return train_state.TrainState.create(
         apply_fn=model.apply, params=params, tx=optimizer)

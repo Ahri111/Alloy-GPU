@@ -307,7 +307,7 @@ def train_one_comp(comp_code, structures, cfg, hp, model_name, ckpt_params,
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=lr * 0.1, peak_value=lr,
         warmup_steps=30, decay_steps=args.epochs, end_value=lr * 0.01)
-    optimizer = optax.chain(optax.clip_by_global_norm(5.0), optax.adam(schedule))
+    optimizer = optax.chain(optax.clip_by_global_norm(5.0), optax.adamw(schedule))
 
     state = train_state.TrainState.create(
         apply_fn=model.apply, params=params, tx=optimizer)
