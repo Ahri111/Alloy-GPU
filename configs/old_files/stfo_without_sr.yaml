@@ -1,0 +1,41 @@
+mode: ablation
+dataset_name: stfo
+cif_dir: ./data/CIF
+csv_path: ./data/CIF/detailed_info.csv
+spin_pkl: null
+id_col: id
+comp_regex: _(\d+)
+n_atoms: 160
+has_spin: false
+species_map:
+  22: 0
+  26: 1
+  8: 2
+  54: 3
+exclude_species:
+- 38
+graph:
+  cutoff: 4.08
+  n_shells: 4
+  shell_edges:
+  - 0.0
+  - 2.41
+  - 3.135
+  - 3.705
+  - 4.08
+  max_num_nbr: 12
+ablation:
+  seed: 42
+  val_frac: 0.15
+  test_frac: 0.15
+  max_epochs: 3000
+  patience: 80
+  batch_size: 32
+  n_trials: 30
+  optuna_timeout: null
+  run_models:
+  - ising_lite
+  - neuralce_evenodd_lite
+  - neuralce_sisj_lite
+  - gnn_sisj_lite
+  - gnn_evenodd_lite

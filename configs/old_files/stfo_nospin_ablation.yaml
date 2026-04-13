@@ -1,0 +1,31 @@
+# ═══════════════════════════════════════════════════════════════════════
+# STO-SFO ablation (no spin)
+# ═══════════════════════════════════════════════════════════════════════
+mode: ablation
+
+dataset_name: stfo_nospin
+cif_dir:      ./data/CIF_SrTiO-SrFeO
+csv_path:     ./data/CIF_SrTiO-SrFeO/detailed_info.csv
+spin_pkl:     null
+id_col:       id
+comp_regex:   '_(\d+)'
+
+species_map:
+  22: 0   # Ti
+  26: 1   # Fe
+  8:  2   # O
+  54: 3   # Vo (Xe)
+n_atoms:  160
+has_spin: false
+
+ablation:
+  seed:       42
+  val_frac:   0.15
+  test_frac:  0.15
+  max_epochs: 3000
+  patience:   80
+  batch_size: 32
+  n_trials:   30
+  optuna_timeout: null
+  run_models:
+    - ising_lite

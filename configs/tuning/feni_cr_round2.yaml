@@ -1,0 +1,39 @@
+mode: ablation
+dataset_name: feni_cr
+cif_dir: ./data/processed/feni_cr
+csv_path: ./data/processed/feni_cr/detailed_info.csv
+id_col: id
+comp_regex: Fe(\d+)
+n_atoms: 108
+has_spin: true
+species_map:
+  26: 0    # Fe
+  28: 1    # Ni
+  24: 2    # Cr
+exclude_species: []
+
+graph:
+  max_num_nbr: 18
+  candidates:
+    3.65:
+      n_shells: 2
+      shell_edges: [0.0, 3.075, 3.65]
+
+ablation:
+  output_dir: ./best_pkl/feni_cr
+  seed: 42
+  val_frac: 0.15
+  test_frac: 0.15
+  max_epochs: 2000
+  patience: 100
+  batch_size: 32
+  n_trials: 200
+  optuna_timeout: null
+  search_space:
+    atom_fea_len: [8, 9, 10, 11, 12, 13, 14, 15, 16]
+    n_conv: [1, 2, 3]
+    h_fea_len: [16, 20, 24, 28, 32]
+    lr: [0.0001, 0.005]
+    odd_fea_len: [1, 2, 4]
+  run_models:
+  - hegnn_lite

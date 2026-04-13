@@ -1,0 +1,73 @@
+mode: ablation
+dataset_name: stfo_wo_spin
+cif_dir: ./data/processed/stfo_wo_spin
+csv_path: ./data/processed/stfo_wo_spin/detailed_info.csv
+id_col: id
+comp_regex: '(\d+)_'
+
+n_atoms: 128
+has_spin: false
+species_map:
+  22: 0
+  26: 1
+  8: 2
+  54: 3
+exclude_species:
+- 38
+graph:
+  max_num_nbr: 17
+  candidates:
+    4.08:
+      n_shells: 4
+      shell_edges:
+      - 0.0
+      - 2.41
+      - 3.135
+      - 3.705
+      - 4.08
+      max_num_nbr: 16
+    4.25:
+      n_shells: 5
+      shell_edges:
+      - 0.0
+      - 2.41
+      - 3.135
+      - 3.705
+      - 4.115
+      - 4.25
+
+ablation:
+  output_dir: ./best_pkl/stfo_wo_spin
+  seed: 42
+  val_frac: 0.15
+  test_frac: 0.15
+  max_epochs: 2000
+  patience: 100
+  batch_size: 32
+  n_trials: 200
+  optuna_timeout: null
+  search_space:
+    atom_fea_len:
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    n_conv:
+    - 3
+    - 3
+    h_fea_len:
+    - 16
+    - 20
+    - 24
+    - 28
+    - 32
+    lr:
+    - 5.0e-05
+    - 0.002
+  run_models:
+  - ising_lite

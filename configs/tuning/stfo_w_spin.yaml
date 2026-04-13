@@ -1,0 +1,45 @@
+mode: ablation
+dataset_name: stfo_w_spin
+cif_dir: ./data/processed/stfo_w_spin
+csv_path: ./data/processed/stfo_w_spin/detailed_info.csv
+id_col: id
+comp_regex: '_(\d+)'
+n_atoms: 160
+has_spin: true
+species_map:
+  22: 0    # Ti
+  26: 1    # Fe
+  8:  2    # O
+  54: 3    # Vo (Xe dummy)
+exclude_species: [38]
+graph:
+  max_num_nbr: 12
+  candidates:
+    4.08:
+      n_shells: 4
+      shell_edges: [0.0, 2.41, 3.135, 3.705, 4.08]
+    4.25:
+      n_shells: 5
+      shell_edges: [0.0, 2.41, 3.135, 3.705, 4.115, 4.25]
+    4.73:
+      n_shells: 7
+      shell_edges: [0.0, 2.41, 3.135, 3.705, 4.115, 4.315, 4.56, 4.73]
+ablation:
+  output_dir: ./best_pkl/stfo_w_spin
+  seed: 42
+  val_frac: 0.15
+  test_frac: 0.15
+  max_epochs: 2000
+  patience: 60
+  batch_size: 32
+  n_trials: 100
+  optuna_timeout: null
+  search_space:
+    atom_fea_len: [8, 9, 10, 11, 12, 13, 14, 15, 16]
+    n_conv: [1, 2, 3]
+    h_fea_len: [16, 20, 24, 28, 32]
+    lr: [5.0e-5, 2.0e-3]
+    odd_fea_len: [1, 2, 4, 8]
+  run_models:
+    - neuralce_evenodd_lite
+    - neuralce_sisj_lite

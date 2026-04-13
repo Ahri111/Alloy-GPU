@@ -1,0 +1,38 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Fe-Ni-Cr PT-MCMC (CLAMM dataset from Tianyu)
+# ═══════════════════════════════════════════════════════════════════════
+# TODO: fill in paths when dataset is ready
+mode: pt_mcmc
+
+dataset_name: fenic
+cif_dir:      ./data/mag_data
+csv_path:     ./data/mag_data/detailed_info.csv
+spin_pkl:     ./data/mag_data/spin_info.pkl
+id_col:       id
+comp_regex:   '_(\d+)'
+
+species_map:
+  26: 0   # Fe
+  28: 1   # Ni
+  24: 2   # Cr
+n_atoms:  null   # TODO: set after dataset inspection
+has_spin: true
+
+pt_mcmc:
+  cif_path:       null   # TODO
+  atom_init_path: null   # TODO
+  model_ckpt:     null   # TODO
+
+  batch_size:     3000
+  n_steps:        100000
+  t_min:          200.0
+  t_max:          2000.0
+  chunk_size:     200
+  swap_interval:  10
+
+  burnin_chunks:  200
+  save_every:     10
+  output:         pt_result_fenic.npz
+
+  matmul_precision: float32
+  enable_x64:      false
