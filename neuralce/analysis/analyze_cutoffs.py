@@ -16,6 +16,7 @@ import yaml
 from collections import defaultdict
 from pymatgen.core.structure import Structure
 from pymatgen.core import DummySpecies
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -98,9 +99,9 @@ def collect_distances(cif_dir, max_dist, exclude_z, sample_n=10, round_dec=2):
 
     for cif_path in cif_files:
         cif_id = os.path.basename(cif_path).replace('.cif', '')
-        crystal = Structure.from_file(cif_path)
+        crystal = load_cif_safe(cif_path)
         if exclude_z:
-            keep = [i for i, s in enumerate(crystal) if s.specie.Z not in exclude_z]
+            keep = [i for i, s in enumerate(crystal) if get_specie_number(s.specie) not in exclude_z]
             crystal = Structure.from_sites([crystal[i] for i in keep])
 
         labels = [get_label(s) for s in crystal]
@@ -495,9 +496,9 @@ def main():
         cif_files_all = sorted(glob.glob(os.path.join(cif_dir, "*.cif")))
         all_atom_counts = set()
         for cif_path in cif_files_all:
-            crystal = Structure.from_file(cif_path)
+            crystal = load_cif_safe(cif_path)
             if exclude_z:
-                keep = [i for i, s in enumerate(crystal) if s.specie.Z not in exclude_z]
+                keep = [i for i, s in enumerate(crystal) if get_specie_number(s.specie) not in exclude_z]
                 crystal = Structure.from_sites([crystal[i] for i in keep])
             all_atom_counts.add(len(crystal))
         if all_atom_counts != atom_counts:

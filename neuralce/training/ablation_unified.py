@@ -31,6 +31,7 @@ Usage:
 import os, time, pickle, json, copy, random as pyrandom, re
 import numpy as np
 from scipy.stats import spearmanr
+from sklearn.metrics import r2_score
 
 import jax
 import jax.numpy as jnp
@@ -48,9 +49,10 @@ except ImportError:
 
 import pandas as pd
 from pymatgen.core.structure import Structure
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
-from NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
-                           needs_spin, LITE_MODELS)
+from neuralce.models.NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
+                                          needs_spin, LITE_MODELS)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -78,7 +80,7 @@ COMP_REGEX   = _cfg.get('comp_regex', r'_(\d+)')
 SPECIES_MAP  = {int(k): v for k, v in _cfg['species_map'].items()}
 N_SPECIES    = len(SPECIES_MAP)
 N_ATOMS      = _cfg['n_atoms']              # will be overwritten if exclude_species
-N_ATOMS_ORIG = _cfg['n_atoms']              # original count for per-atom metrics
+N_ATOMS_ORIG = _cfg.get('n_atoms_orig', _cfg['n_atoms'])  # supercell 원자 수 (per-atom 정규화용)
 HAS_SPIN     = _cfg.get('has_spin', False)
 
 # Species exclusion: remove constant-site atoms from graph
@@ -102,6 +104,7 @@ if _candidates is not None:
         GRAPH_CANDIDATES[cut] = {
             'n_shells': info['n_shells'],
             'shell_edges': info['shell_edges'],
+            'max_num_nbr': info.get('max_num_nbr', GRAPH_MAX_NUM_NBR),
         }
     GRAPH_MODE = 'candidates'
     print(f"Graph config: {len(GRAPH_CANDIDATES)} cutoff candidates "
@@ -112,6 +115,7 @@ elif _graph.get('cutoff') is not None:
         _graph['cutoff']: {
             'n_shells': _graph['n_shells'],
             'shell_edges': _graph.get('shell_edges'),
+            'max_num_nbr': _graph.get('max_num_nbr', GRAPH_MAX_NUM_NBR),
         }
     }
     GRAPH_MODE = 'fixed'
@@ -133,9 +137,11 @@ PATIENCE     = _abl.get('patience', 80)
 BATCH_SIZE   = _abl.get('batch_size', 32)
 N_TRIALS     = _abl.get('n_trials', 30)
 OPTUNA_TIMEOUT = _abl.get('optuna_timeout', None)
+OUTPUT_DIR     = _abl.get('output_dir', '.')
 
 # Search space from config (with defaults)
 _ss = _abl.get('search_space', {})
+SS_HIDDEN_DIM   = _ss.get('hidden_dim', None)
 SS_ATOM_FEA_LEN = _ss.get('atom_fea_len', [8, 16, 24, 32, 48])
 SS_N_CONV       = _ss.get('n_conv', [2, 5])           # [min, max]
 SS_H_FEA_LEN    = _ss.get('h_fea_len', [16, 32, 64, 128])
@@ -187,23 +193,14 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex,
         id_col = 'id' if 'id' in df.columns else 'cif_id'
     energy_map = dict(zip(df[id_col].astype(str), df['total_energy'].values))
 
-    # Spin: try (1) spin_pkl, (2) CSV 'spins' column, (3) zeros
-    spin_map = {}
+    # Spin: load if available, else empty dict → fallback to zeros
     if spin_pkl_path and os.path.exists(spin_pkl_path):
         spin_df = pd.read_pickle(spin_pkl_path)
         spin_map = dict(zip(spin_df['cif_id'].astype(str),
                             spin_df['spin_states'].values))
-        print(f"  Spin data loaded from PKL: {len(spin_map)} entries")
-    elif 'spins' in df.columns:
-        import json as _json
-        for _, row in df.iterrows():
-            sid = str(row[id_col])
-            try:
-                spin_map[sid] = _json.loads(row['spins'])
-            except (ValueError, TypeError):
-                pass
-        print(f"  Spin data loaded from CSV: {len(spin_map)} entries")
+        print(f"  Spin data loaded: {len(spin_map)} entries")
     else:
+        spin_map = {}
         print(f"  No spin data → all spins set to 0")
 
     structures = []
@@ -216,14 +213,14 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex,
             n_skip += 1
             continue
 
-        crystal = Structure.from_file(os.path.join(cif_dir, cif_file))
+        crystal = load_cif_safe(os.path.join(cif_dir, cif_file))
         spins = spin_map.get(cif_id, [0] * len(crystal))
         spins = np.array(spins, dtype=np.float32)
 
         # --- Filter excluded species ---
         if exclude_z:
             keep_idx = [i for i, site in enumerate(crystal)
-                        if site.specie.Z not in exclude_z]
+                        if get_specie_number(site.specie) not in exclude_z]
             crystal = Structure.from_sites([crystal[i] for i in keep_idx])
             spins = spins[keep_idx]
 
@@ -274,7 +271,7 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr=12, include_sisj=Fals
     # Node features
     atom_fea = np.zeros((n_at, N_SPECIES), dtype=np.float32)
     for i, site in enumerate(crystal):
-        z = site.specie.Z
+        z = get_specie_number(site.specie)
         if z in SPECIES_MAP:
             atom_fea[i, SPECIES_MAP[z]] = 1.0
 
@@ -451,8 +448,12 @@ def train_step_nospin(state, batch):
     return state.apply_gradients(grads=grads), loss
 
 
-def eval_epoch(state, dataset, indices, use_spin):
-    """Evaluate on a subset."""
+def eval_epoch(state, dataset, indices, use_spin, return_per_comp_srcc=False):
+    """Evaluate on a subset.
+    
+    If return_per_comp_srcc=True, also compute mean per-composition SRCC
+    using dataset['comps'].
+    """
     all_preds, all_targets = [], []
     total_loss, n_total = 0.0, 0
 
@@ -472,11 +473,34 @@ def eval_epoch(state, dataset, indices, use_spin):
         all_preds.append(np.array(pred))
         all_targets.append(np.array(targets))
 
-    return total_loss / max(n_total, 1), np.concatenate(all_preds), np.concatenate(all_targets)
+    val_loss = total_loss / max(n_total, 1)
+    preds = np.concatenate(all_preds)
+    targets = np.concatenate(all_targets)
+
+    if not return_per_comp_srcc:
+        return val_loss, preds, targets
+
+    # Per-composition (SRCC + R²) / 2
+    comps = [dataset['comps'][i] for i in indices]
+    comp_scores = []
+    for c in sorted(set(comps)):
+        mask = [i for i, cc in enumerate(comps) if cc == c]
+        if len(mask) >= 3:
+            rho = spearmanr(targets[mask], preds[mask]).correlation
+            r2 = r2_score(targets[mask], preds[mask])
+            if not np.isnan(rho) and not np.isnan(r2):
+                comp_scores.append((rho + r2) / 2.0)
+    mean_comp_score = np.mean(comp_scores) if comp_scores else 0.0
+
+    return val_loss, preds, targets, mean_comp_score
 
 
 def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
-    """Full training loop."""
+    """Full training loop.
+    
+    Best model is selected by mean per-composition SRCC (highest = best).
+    Returns negative mean_comp_srcc for Optuna minimization.
+    """
     use_spin = is_spin_model(model_name)
     model = create_model(model_name, hp)
     rng = jax.random.PRNGKey(SEED)
@@ -485,7 +509,8 @@ def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
 
     step_fn = train_step_spin if use_spin else train_step_nospin
 
-    best_val = float('inf')
+    best_score = -float('inf')  # mean per-comp SRCC (higher is better)
+    best_val_mse = float('inf')
     best_params = None
     patience_ctr = 0
     best_epoch = 0
@@ -507,10 +532,12 @@ def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
             n_bat += 1
         epoch_loss /= max(n_bat, 1)
 
-        val_loss, _, _ = eval_epoch(state, dataset, val_idx, use_spin)
+        val_loss, _, _, mean_comp_score = eval_epoch(
+            state, dataset, val_idx, use_spin, return_per_comp_srcc=True)
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if mean_comp_score > best_score:
+            best_score = mean_comp_score
+            best_val_mse = val_loss
             best_params = copy.deepcopy(state.params)
             patience_ctr = 0
             best_epoch = epoch
@@ -521,14 +548,17 @@ def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
             break
 
         if trial is not None and HAS_OPTUNA:
-            trial.report(val_loss, epoch)
+            # Optuna minimizes, so report negative score
+            trial.report(-mean_comp_score, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
         if epoch % 500 == 0:
-            print(f"    [epoch {epoch:5d}] train={epoch_loss:.6f} val={val_loss:.6f}")
+            print(f"    [epoch {epoch:5d}] train_MSE={epoch_loss:.6f} "
+                  f"val_MSE={val_loss:.6f} mean_comp_score={mean_comp_score:.4f}")
 
-    return best_val, best_params, best_epoch, n_params
+    # Return negative SRCC for Optuna (minimize), plus val_mse for logging
+    return -best_score, best_params, best_epoch, n_params, best_val_mse
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -537,9 +567,14 @@ def train_model(model_name, hp, dataset, train_idx, val_idx, trial=None):
 
 def make_objective(model_name, structures, graph_cache, train_idx, val_idx):
     def objective(trial):
-        atom_fea_len = trial.suggest_categorical('atom_fea_len', SS_ATOM_FEA_LEN)
+        if SS_HIDDEN_DIM is not None:
+            hidden_dim   = trial.suggest_categorical('hidden_dim', SS_HIDDEN_DIM)
+            atom_fea_len = hidden_dim
+            h_fea_len    = hidden_dim
+        else:
+            atom_fea_len = trial.suggest_categorical('atom_fea_len', SS_ATOM_FEA_LEN)
+            h_fea_len    = trial.suggest_categorical('h_fea_len', SS_H_FEA_LEN)
         n_conv       = trial.suggest_int('n_conv', SS_N_CONV[0], SS_N_CONV[1])
-        h_fea_len    = trial.suggest_categorical('h_fea_len', SS_H_FEA_LEN)
         lr           = trial.suggest_float('lr', SS_LR[0], SS_LR[1], log=True)
 
         # Graph params: 3 modes
@@ -549,13 +584,13 @@ def make_objective(model_name, structures, graph_cache, train_idx, val_idx):
             info = GRAPH_CANDIDATES[cutoff]
             n_shells    = info['n_shells']
             shell_edges = info['shell_edges']
-            max_num_nbr = GRAPH_MAX_NUM_NBR
+            max_num_nbr = info.get('max_num_nbr', GRAPH_MAX_NUM_NBR)
         elif GRAPH_MODE == 'fixed':
             cutoff = list(GRAPH_CANDIDATES.keys())[0]
             info = GRAPH_CANDIDATES[cutoff]
             n_shells    = info['n_shells']
             shell_edges = info['shell_edges']
-            max_num_nbr = GRAPH_MAX_NUM_NBR
+            max_num_nbr = info.get('max_num_nbr', GRAPH_MAX_NUM_NBR)
         else:  # 'search'
             cutoff      = trial.suggest_float('cutoff', 3.0, 7.0, step=0.5)
             n_shells    = trial.suggest_int('n_shells', 2, 6)
@@ -583,16 +618,19 @@ def make_objective(model_name, structures, graph_cache, train_idx, val_idx):
         dataset = graph_cache[cache_key]
 
         print(f"  Trial {trial.number}: {hp}")
-        best_val, best_params, best_epoch, n_params = train_model(
+        neg_score, best_params, best_epoch, n_params, best_val_mse = train_model(
             model_name, hp, dataset, train_idx, val_idx, trial=trial)
 
         trial.set_user_attr('best_params', best_params)
         trial.set_user_attr('best_epoch', best_epoch)
         trial.set_user_attr('n_params', n_params)
         trial.set_user_attr('hp', hp)
+        trial.set_user_attr('val_mse', best_val_mse)
 
-        print(f"    → val_MSE={best_val:.6f} @ epoch {best_epoch} | params={n_params:,}")
-        return best_val
+        mean_score = -neg_score
+        print(f"    → mean_comp_score={mean_score:.4f} (val_MSE={best_val_mse:.6f}) "
+              f"@ epoch {best_epoch} | params={n_params:,}")
+        return neg_score
     return objective
 
 
@@ -623,7 +661,7 @@ def compute_metrics(targets, preds, comps_subset=None):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
+def main():
     pyrandom.seed(SEED)
     np.random.seed(SEED)
 
@@ -672,9 +710,11 @@ if __name__ == '__main__':
             best_params = bt.user_attrs['best_params']
             best_epoch  = bt.user_attrs['best_epoch']
             n_params    = bt.user_attrs['n_params']
-            best_val    = bt.value
+            best_val_mse = bt.user_attrs.get('val_mse', float('nan'))
+            best_mean_score = -bt.value
             print(f"\n  Best: {best_hp}")
-            print(f"  val_MSE={best_val:.6f} @ epoch {best_epoch} | params={n_params:,}")
+            print(f"  mean_comp_score={best_mean_score:.4f} (val_MSE={best_val_mse:.6f}) "
+                  f"@ epoch {best_epoch} | params={n_params:,}")
         else:
             # Single run with default HP — use first candidate if available
             if GRAPH_CANDIDATES:
@@ -683,17 +723,19 @@ if __name__ == '__main__':
                 _def_cutoff = _first_cut
                 _def_nshells = _first_info['n_shells']
                 _def_shell_edges = _first_info['shell_edges']
+                _def_max_num_nbr = _first_info.get('max_num_nbr', GRAPH_MAX_NUM_NBR)
             else:
                 _def_cutoff = 5.5
                 _def_nshells = 4
                 _def_shell_edges = None
+                _def_max_num_nbr = GRAPH_MAX_NUM_NBR
 
             best_hp = {
                 'atom_fea_len': 16, 'n_conv': 2, 'h_fea_len': 32,
                 'odd_fea_len': 4, 'lr': 1e-3,
                 'cutoff': _def_cutoff,
                 'n_shells': _def_nshells,
-                'max_num_nbr': GRAPH_MAX_NUM_NBR,
+                'max_num_nbr': _def_max_num_nbr,
             }
             sisj = is_sisj_model(model_name)
             ck = (best_hp['cutoff'], best_hp['n_shells'], best_hp['max_num_nbr'], sisj)
@@ -705,9 +747,11 @@ if __name__ == '__main__':
             dataset = graph_cache[ck]
 
             print(f"  Single run: {best_hp}")
-            best_val, best_params, best_epoch, n_params = train_model(
+            neg_srcc, best_params, best_epoch, n_params, best_val_mse = train_model(
                 model_name, best_hp, dataset, train_idx, val_idx)
-            print(f"  val_MSE={best_val:.6f} @ epoch {best_epoch} | params={n_params:,}")
+            best_mean_score = -neg_srcc
+            print(f"  mean_comp_score={best_mean_score:.4f} (val_MSE={best_val_mse:.6f}) "
+                  f"@ epoch {best_epoch} | params={n_params:,}")
 
         # --- Test evaluation ---
         sisj = is_sisj_model(model_name)
@@ -746,15 +790,45 @@ if __name__ == '__main__':
 
         all_results.append({
             'name': model_name, 'hp': best_hp, 'n_params': n_params,
-            'val_mse': best_val, 'best_epoch': best_epoch,
+            'val_mse': best_val_mse, 'val_mean_comp_srcc': best_mean_score,
+            'best_epoch': best_epoch,
             'test_targets': targets_test, 'test_preds': preds_test,
             'test_metrics': metrics, 'test_metrics_pa': metrics_pa,
         })
 
-        ckpt_path = f'best_{DATASET_NAME}_{model_name}.pkl'
+        # Resolve shell_edges for this model's best cutoff
+        _best_se = None
+        if GRAPH_CANDIDATES and best_hp['cutoff'] in GRAPH_CANDIDATES:
+            _best_se = GRAPH_CANDIDATES[best_hp['cutoff']].get('shell_edges')
+
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        ckpt_path = os.path.join(OUTPUT_DIR, f'best_{DATASET_NAME}_{model_name}.pkl')
         with open(ckpt_path, 'wb') as f:
-            pickle.dump({'params': best_params, 'hp': best_hp,
-                         'model_name': model_name}, f)
+            pickle.dump({
+                'params': best_params,
+                'hp': best_hp,
+                'model_name': model_name,
+                'shell_edges': _best_se,
+                'data_cfg': {
+                    'cif_dir': CIF_DIR,
+                    'csv_path': DETAILED_CSV,
+                    'spin_pkl': SPIN_PKL,
+                    'id_col': ID_COL,
+                    'comp_regex': COMP_REGEX,
+                    'species_map': SPECIES_MAP,
+                    'exclude_z': sorted(EXCLUDE_Z),
+                    'n_atoms': N_ATOMS,
+                },
+                'split_cfg': {
+                    'seed': SEED,
+                    'val_frac': VAL_FRAC,
+                    'test_frac': TEST_FRAC,
+                    'batch_size': BATCH_SIZE,
+                },
+                'train_idx': train_idx.tolist(),
+                'val_idx': val_idx.tolist(),
+                'test_idx': test_idx.tolist(),
+            }, f)
         print(f"  Saved → {ckpt_path}")
 
     # --- Summary ---
@@ -771,13 +845,17 @@ if __name__ == '__main__':
     print(f"  graph atoms={N_ATOMS}  orig atoms={N_ATOMS_ORIG}")
     print(f"{'='*70}")
     print(f"{'#':<3} {'Model':<26} {'Role':<24} {'Params':>7} "
-          f"{'RMSE(eV/at)':>12} {'MAE(eV/at)':>12} {'SRCC':>7}")
-    print(f"{'-'*3} {'-'*26} {'-'*24} {'-'*7} {'-'*12} {'-'*12} {'-'*7}")
+          f"{'RMSE(eV/at)':>12} {'MAE(eV/at)':>12} {'SRCC':>7} {'CompSRCC':>8}")
+    print(f"{'-'*3} {'-'*26} {'-'*24} {'-'*7} {'-'*12} {'-'*12} {'-'*7} {'-'*8}")
     for i, r in enumerate(all_results):
         m = r['test_metrics_pa']
         role = ROLES.get(r['name'], '')
+        # Compute test mean per-comp SRCC
+        comp_vals = list(m['srcc_per_comp'].values())
+        test_comp_srcc = np.mean(comp_vals) if comp_vals else float('nan')
         print(f"{i:<3} {r['name']:<26} {role:<24} {r['n_params']:>7,} "
-              f"{m['rmse']:>12.6f} {m['mae']:>12.6f} {m['srcc_global']:>7.4f}")
+              f"{m['rmse']:>12.6f} {m['mae']:>12.6f} {m['srcc_global']:>7.4f} "
+              f"{test_comp_srcc:>8.4f}")
 
     # --- Save ---
     meta = {
@@ -805,7 +883,11 @@ if __name__ == '__main__':
         suffix = '_no' + '_'.join(z_names.get(z, f'Z{z}') for z in sorted(EXCLUDE_Z))
     else:
         suffix = ''
-    outname = f'ablation_{DATASET_NAME}{suffix}_results.json'
+    outname = os.path.join(OUTPUT_DIR, f'ablation_{DATASET_NAME}{suffix}_results.json')
     with open(outname, 'w') as f:
         json.dump({'meta': meta, 'results': log}, f, indent=2, default=str)
     print(f"\nSaved → {outname}")
+
+
+if __name__ == '__main__':
+    main()

@@ -48,6 +48,7 @@ except ImportError:
 
 import pandas as pd
 from pymatgen.core.structure import Structure
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
 from neuralce.models.NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
                                           needs_spin, LITE_MODELS)
@@ -208,14 +209,14 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex,
             n_skip += 1
             continue
 
-        crystal = Structure.from_file(os.path.join(cif_dir, cif_file))
+        crystal = load_cif_safe(os.path.join(cif_dir, cif_file))
         spins = spin_map.get(cif_id, [0] * len(crystal))
         spins = np.array(spins, dtype=np.float32)
 
         # --- Filter excluded species ---
         if exclude_z:
             keep_idx = [i for i, site in enumerate(crystal)
-                        if site.specie.Z not in exclude_z]
+                        if get_specie_number(site.specie) not in exclude_z]
             crystal = Structure.from_sites([crystal[i] for i in keep_idx])
             spins = spins[keep_idx]
 
@@ -266,7 +267,7 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr=12, include_sisj=Fals
     # Node features
     atom_fea = np.zeros((n_at, N_SPECIES), dtype=np.float32)
     for i, site in enumerate(crystal):
-        z = site.specie.Z
+        z = get_specie_number(site.specie)
         if z in SPECIES_MAP:
             atom_fea[i, SPECIES_MAP[z]] = 1.0
 
@@ -783,10 +784,39 @@ def main():
             'test_metrics': metrics, 'test_metrics_pa': metrics_pa,
         })
 
+        # Resolve shell_edges for this model's best cutoff
+        _best_se = None
+        if GRAPH_CANDIDATES and best_hp['cutoff'] in GRAPH_CANDIDATES:
+            _best_se = GRAPH_CANDIDATES[best_hp['cutoff']].get('shell_edges')
+
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         ckpt_path = os.path.join(OUTPUT_DIR, f'best_{DATASET_NAME}_{model_name}.pkl')
         with open(ckpt_path, 'wb') as f:
-            pickle.dump({'params': best_params, 'hp': best_hp}, f)
+            pickle.dump({
+                'params': best_params,
+                'hp': best_hp,
+                'model_name': model_name,
+                'shell_edges': _best_se,
+                'data_cfg': {
+                    'cif_dir': CIF_DIR,
+                    'csv_path': DETAILED_CSV,
+                    'spin_pkl': SPIN_PKL,
+                    'id_col': ID_COL,
+                    'comp_regex': COMP_REGEX,
+                    'species_map': SPECIES_MAP,
+                    'exclude_z': sorted(EXCLUDE_Z),
+                    'n_atoms': N_ATOMS,
+                },
+                'split_cfg': {
+                    'seed': SEED,
+                    'val_frac': VAL_FRAC,
+                    'test_frac': TEST_FRAC,
+                    'batch_size': BATCH_SIZE,
+                },
+                'train_idx': train_idx.tolist(),
+                'val_idx': val_idx.tolist(),
+                'test_idx': test_idx.tolist(),
+            }, f)
         print(f"  Saved → {ckpt_path}")
 
     # --- Summary ---

@@ -14,7 +14,7 @@ species_map:
   22: 0   # Ti
   26: 1   # Fe
   8:  2   # O
-  54: 3   # Vo (Xe)
+  0: 3   # Vo (Xe)
 n_atoms:  160
 has_spin: true
 

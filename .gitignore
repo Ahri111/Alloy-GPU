@@ -30,3 +30,10 @@ build/
 .DS_Store
 __MACOSX/
 *.Zone.Identifier
+
+# ── Personal debug notebooks ──────────────────────────────────────────
+debug.ipynb
+verify.ipynb
+
+# ── Misplaced data ────────────────────────────────────────────────────
+configs/CIF/

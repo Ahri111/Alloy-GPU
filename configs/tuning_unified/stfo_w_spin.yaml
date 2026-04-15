@@ -5,6 +5,7 @@ csv_path: ./data/processed/stfo_w_spin/detailed_info.csv
 id_col: id
 comp_regex: '_(\d+)'
 n_atoms: 160
+n_atoms_orig: 160
 has_spin: true
 species_map:
   22: 0    # Ti
@@ -24,20 +25,23 @@ graph:
     4.73:
       n_shells: 7
       shell_edges: [0.0, 2.41, 3.135, 3.705, 4.115, 4.315, 4.56, 4.73]
+    4.52:
+      n_shells: 6
+      shell_edges: [0.0, 2.41, 3.135, 3.705, 4.115, 4.315, 4.52]
+      max_num_nbr: 32
 ablation:
-  output_dir: ./best_pkl/stfo_w_spin
+  output_dir: ./best_pkl/stfo_w_spin_unified
   seed: 42
   val_frac: 0.15
   test_frac: 0.15
   max_epochs: 2000
-  patience: 60
+  patience: 100
   batch_size: 32
-  n_trials: 100
+  n_trials: 200
   optuna_timeout: null
   search_space:
-    atom_fea_len: [8, 9, 10, 11, 12, 13, 14, 15, 16]
-    n_conv: [1, 2, 3]
-    h_fea_len: [16, 20, 24, 28, 32]
+    hidden_dim: [8, 12, 16, 20, 24, 28, 32]
+    n_conv: [2, 3, 4]
     lr: [5.0e-5, 2.0e-3]
     odd_fea_len: [1, 2, 4, 8]
   run_models:

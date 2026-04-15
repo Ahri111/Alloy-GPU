@@ -1,0 +1,30 @@
+# STFO PT-MCMC (no spin) — pt_mcmc_new.py (v4.1)
+mode: pt_mcmc
+
+dataset_name: stfo_nospin
+
+species_map:
+  22: 0   # Ti
+  26: 1   # Fe
+  8:  2   # O
+  0: 3   # Vo (Xe)
+n_atoms:  160
+has_spin: false
+
+pt_mcmc:
+  cif_path:       ./data/raw/stfo/387.cif
+  atom_init_path: ./data/raw/stfo/atom_init.json
+  model_ckpt:     ./best_pkl/retrained/retrained_stfo_wo_spin_ising_lite_3.pkl
+
+  n_replicas:     3000
+  n_steps:        100000
+  t_min:          200.0
+  t_max:          2000.0
+  chunk_size:     200
+  swap_interval:  10
+  burnin_frac:    0.2
+  seed:           42
+  output:         ./pt_result_stfo_v41.npz
+
+  matmul_precision: float32
+  enable_x64:      false

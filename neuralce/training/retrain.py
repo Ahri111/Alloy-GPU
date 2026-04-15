@@ -28,6 +28,7 @@ import optax
 import pandas as pd
 from scipy.stats import spearmanr
 from pymatgen.core.structure import Structure
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
 from neuralce.models.NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
                                           needs_spin, LITE_MODELS)
@@ -40,8 +41,9 @@ from neuralce.analysis.plot_utils import plot_results
 
 def parse_args():
     p = argparse.ArgumentParser(description="Retrain best model without early stopping.")
-    p.add_argument("--config", type=str, required=True,
-                   help="YAML config (same one used for ablation)")
+    p.add_argument("--config", type=str, default=None,
+                   help="YAML config (same one used for ablation). "
+                        "Optional if checkpoint contains data_cfg/split_cfg.")
     p.add_argument("--checkpoint", type=str, required=True,
                    help="Checkpoint .pkl from ablation (e.g. best_stfo_wo_spin_ising_lite.pkl)")
     p.add_argument("--epochs", type=int, default=3000,
@@ -98,13 +100,13 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex, exclude_z=No
         if cif_id not in energy_map:
             continue
 
-        crystal = Structure.from_file(os.path.join(cif_dir, cif_file))
+        crystal = load_cif_safe(os.path.join(cif_dir, cif_file))
         spins = spin_map.get(cif_id, [0] * len(crystal))
         spins = np.array(spins, dtype=np.float32)
 
         if exclude_z:
             keep_idx = [i for i, site in enumerate(crystal)
-                        if site.specie.Z not in exclude_z]
+                        if get_specie_number(site.specie) not in exclude_z]
             crystal = Structure.from_sites([crystal[i] for i in keep_idx])
             spins = spins[keep_idx]
 
@@ -129,7 +131,7 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr, species_map,
 
     atom_fea = np.zeros((n_at, n_species), dtype=np.float32)
     for i, site in enumerate(crystal):
-        z = site.specie.Z
+        z = get_specie_number(site.specie)
         if z in species_map:
             atom_fea[i, species_map[z]] = 1.0
 
@@ -275,30 +277,49 @@ def create_model(model_name, hp):
 def main():
     args = parse_args()
 
-    # ── Load config ───────────────────────────────────────────────────
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-
-    cif_dir    = cfg['cif_dir']
-    csv_path   = cfg['csv_path']
-    spin_pkl   = cfg.get('spin_pkl')
-    id_col     = cfg.get('id_col', 'id')
-    comp_regex = cfg.get('comp_regex', r'_(\d+)')
-    species_map = {int(k): v for k, v in cfg['species_map'].items()}
-    exclude_z  = set(cfg.get('exclude_species', []))
-
-    _n_atoms_cfg = cfg.get('n_atoms', 'auto')
-
-    _abl = cfg.get('ablation', {})
-    seed = _abl.get('seed', 42)
-    batch_size = args.batch_size or _abl.get('batch_size', 32)
-    val_frac  = _abl.get('val_frac', 0.15)
-    test_frac = _abl.get('test_frac', 0.15)
-
     # ── Load checkpoint ───────────────────────────────────────────────
     with open(args.checkpoint, 'rb') as f:
         ckpt = pickle.load(f)
     hp = ckpt['hp']
+
+    # ── Load config (from checkpoint data_cfg or YAML file) ──────────
+    _ckpt_data  = ckpt.get('data_cfg', {})
+    _ckpt_split = ckpt.get('split_cfg', {})
+
+    if args.config:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        cif_dir     = cfg['cif_dir']
+        csv_path    = cfg['csv_path']
+        spin_pkl    = cfg.get('spin_pkl')
+        id_col      = cfg.get('id_col', 'id')
+        comp_regex  = cfg.get('comp_regex', r'_(\d+)')
+        species_map = {int(k): v for k, v in cfg['species_map'].items()}
+        exclude_z   = set(cfg.get('exclude_species', []))
+        _n_atoms_cfg = cfg.get('n_atoms', 'auto')
+        _abl        = cfg.get('ablation', {})
+        seed        = _abl.get('seed', 42)
+        batch_size  = args.batch_size or _abl.get('batch_size', 32)
+        val_frac    = _abl.get('val_frac', 0.15)
+        test_frac   = _abl.get('test_frac', 0.15)
+    elif _ckpt_data:
+        cif_dir     = _ckpt_data['cif_dir']
+        csv_path    = _ckpt_data['csv_path']
+        spin_pkl    = _ckpt_data.get('spin_pkl')
+        id_col      = _ckpt_data.get('id_col', 'id')
+        comp_regex  = _ckpt_data.get('comp_regex', r'_(\d+)')
+        species_map = _ckpt_data['species_map']
+        exclude_z   = set(_ckpt_data.get('exclude_z', []))
+        _n_atoms_cfg = _ckpt_data.get('n_atoms', 'auto')
+        seed        = _ckpt_split.get('seed', 42)
+        batch_size  = args.batch_size or _ckpt_split.get('batch_size', 32)
+        val_frac    = _ckpt_split.get('val_frac', 0.15)
+        test_frac   = _ckpt_split.get('test_frac', 0.15)
+        cfg         = {}
+    else:
+        raise ValueError(
+            "No --config provided and checkpoint has no data_cfg. "
+            "Provide --config or use a checkpoint saved by the current ablation scripts.")
 
     # Infer model name: (1) checkpoint key, (2) CLI --model, (3) run_models, (4) dataset prefix
     model_name = ckpt.get('model_name') or args.model
@@ -323,18 +344,22 @@ def main():
             f"(available: {sorted(LITE_MODELS)})")
 
     # ── Resolve graph config ──────────────────────────────────────────
-    _graph = cfg.get('graph', {})
-    _candidates = _graph.get('candidates')
-    shell_edges = None
     max_num_nbr = hp['max_num_nbr']
-
-    if _candidates and hp['cutoff'] in {float(k) for k in _candidates}:
-        info = _candidates[hp['cutoff']] if hp['cutoff'] in _candidates else _candidates[str(hp['cutoff'])]
-        shell_edges = info.get('shell_edges')
-        if 'max_num_nbr' in info:
-            max_num_nbr = info['max_num_nbr']
-    elif _graph.get('shell_edges'):
-        shell_edges = _graph['shell_edges']
+    # Prefer shell_edges saved in checkpoint; fall back to config if needed
+    if 'shell_edges' in ckpt:
+        shell_edges = ckpt['shell_edges']
+    else:
+        shell_edges = None
+        _graph = cfg.get('graph', {})
+        _candidates = _graph.get('candidates')
+        if _candidates and hp['cutoff'] in {float(k) for k in _candidates}:
+            info = _candidates[hp['cutoff']] if hp['cutoff'] in _candidates \
+                   else _candidates[str(hp['cutoff'])]
+            shell_edges = info.get('shell_edges')
+            if 'max_num_nbr' in info:
+                max_num_nbr = info['max_num_nbr']
+        elif _graph.get('shell_edges'):
+            shell_edges = _graph['shell_edges']
 
     # ── Load data ─────────────────────────────────────────────────────
     print(f"{'═' * 70}")
@@ -371,13 +396,19 @@ def main():
         include_sisj=sisj, shell_edges=shell_edges)
 
     # ── Split ─────────────────────────────────────────────────────────
-    from sklearn.model_selection import train_test_split
-    indices = list(range(len(structures)))
-    trainval_idx, test_idx = train_test_split(indices, test_size=test_frac, random_state=seed)
-    val_rel = val_frac / (1 - test_frac)
-    train_idx, val_idx = train_test_split(trainval_idx, test_size=val_rel, random_state=seed)
-    train_idx, val_idx, test_idx = np.array(train_idx), np.array(val_idx), np.array(test_idx)
-    print(f"Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
+    if 'train_idx' in ckpt:
+        train_idx = np.array(ckpt['train_idx'])
+        val_idx   = np.array(ckpt['val_idx'])
+        test_idx  = np.array(ckpt['test_idx'])
+        print(f"Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)} (from checkpoint)")
+    else:
+        from sklearn.model_selection import train_test_split
+        indices = list(range(len(structures)))
+        trainval_idx, test_idx = train_test_split(indices, test_size=test_frac, random_state=seed)
+        val_rel = val_frac / (1 - test_frac)
+        train_idx, val_idx = train_test_split(trainval_idx, test_size=val_rel, random_state=seed)
+        train_idx, val_idx, test_idx = np.array(train_idx), np.array(val_idx), np.array(test_idx)
+        print(f"Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
 
     # ── Create model & init ───────────────────────────────────────────
     model = create_model(model_name, hp)

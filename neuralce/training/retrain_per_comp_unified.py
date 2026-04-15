@@ -42,10 +42,12 @@ from flax.training import train_state
 import optax
 import pandas as pd
 from scipy.stats import spearmanr
+from sklearn.metrics import r2_score
 from pymatgen.core.structure import Structure
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
-from NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
-                           LITE_MODELS)
+from neuralce.models.NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
+                                          LITE_MODELS)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -67,7 +69,7 @@ def parse_args():
                    help="LR multiplier relative to checkpoint LR (default: 0.1)")
     p.add_argument("--no-resume", action="store_true",
                    help="Random init instead of warm-start")
-    p.add_argument("--output_dir", type=str, default='./best_pkl/per_comp',
+    p.add_argument("--output_dir", type=str, default=None,
                    help="Output directory for per-comp checkpoints")
     p.add_argument("--patience", type=int, default=None,
                    help="Early stopping patience (default: no early stopping)")
@@ -102,13 +104,13 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex, exclude_z=No
         if cif_id not in energy_map:
             continue
 
-        crystal = Structure.from_file(os.path.join(cif_dir, cif_file))
+        crystal = load_cif_safe(os.path.join(cif_dir, cif_file))
         spins = spin_map.get(cif_id, [0] * len(crystal))
         spins = np.array(spins, dtype=np.float32)
 
         if exclude_z:
             keep_idx = [i for i, site in enumerate(crystal)
-                        if site.specie.Z not in exclude_z]
+                        if get_specie_number(site.specie) not in exclude_z]
             crystal = Structure.from_sites([crystal[i] for i in keep_idx])
             spins = spins[keep_idx]
 
@@ -133,7 +135,7 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr, species_map,
 
     atom_fea = np.zeros((n_at, n_species), dtype=np.float32)
     for i, site in enumerate(crystal):
-        z = site.specie.Z
+        z = get_specie_number(site.specie)
         if z in species_map:
             atom_fea[i, species_map[z]] = 1.0
 
@@ -307,7 +309,7 @@ def train_one_comp(comp_code, structures, cfg, hp, model_name, ckpt_params,
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=lr * 0.1, peak_value=lr,
         warmup_steps=30, decay_steps=args.epochs, end_value=lr * 0.01)
-    optimizer = optax.chain(optax.clip_by_global_norm(5.0), optax.adam(schedule))
+    optimizer = optax.chain(optax.clip_by_global_norm(5.0), optax.adamw(schedule))
 
     state = train_state.TrainState.create(
         apply_fn=model.apply, params=params, tx=optimizer)
@@ -366,6 +368,8 @@ def train_one_comp(comp_code, structures, cfg, hp, model_name, ckpt_params,
                 np.concatenate(all_preds), np.concatenate(all_targets))
 
     # ── Training loop ─────────────────────────────────────────────────
+    # Best model = max (SRCC + R²) / 2 on val set
+    best_score = -float('inf')
     best_val = float('inf')
     best_params = None
     best_epoch = 0
@@ -388,9 +392,20 @@ def train_one_comp(comp_code, structures, cfg, hp, model_name, ckpt_params,
             n_bat += 1
         epoch_loss /= max(n_bat, 1)
 
-        val_loss, _, _ = eval_set(state, val_idx)
+        val_loss, val_preds, val_targets = eval_set(state, val_idx)
 
-        if val_loss < best_val:
+        if len(val_targets) >= 3:
+            rho = spearmanr(val_targets, val_preds).correlation
+            r2 = r2_score(val_targets, val_preds)
+            if np.isnan(rho) or np.isnan(r2):
+                val_score = -float('inf')
+            else:
+                val_score = (rho + r2) / 2.0
+        else:
+            val_score = -float('inf')
+
+        if val_score > best_score:
+            best_score = val_score
             best_val = val_loss
             best_params = copy.deepcopy(state.params)
             best_epoch = epoch
@@ -404,9 +419,11 @@ def train_one_comp(comp_code, structures, cfg, hp, model_name, ckpt_params,
 
         if epoch % 200 == 0:
             print(f"  [epoch {epoch:5d}] train={epoch_loss:.6f} "
-                  f"val={val_loss:.6f} best={best_val:.6f}@{best_epoch}")
+                  f"val={val_loss:.6f} val_score={val_score:.4f} "
+                  f"best_score={best_score:.4f}@{best_epoch}")
 
-    print(f"  Training done. Best val_MSE={best_val:.6f} @ epoch {best_epoch}")
+    print(f"  Training done. Best val_score=(SRCC+R²)/2={best_score:.4f} "
+          f"(val_MSE={best_val:.6f}) @ epoch {best_epoch}")
 
     # ── Evaluate on ALL data for this composition ─────────────────────
     state = state.replace(params=best_params)
@@ -438,6 +455,7 @@ def train_one_comp(comp_code, structures, cfg, hp, model_name, ckpt_params,
             'n_structures': len(comp_structs),
             'best_epoch': best_epoch,
             'best_val_mse': float(best_val),
+            'best_val_score': float(best_score),
             'all_rmse': float(rmse),
             'all_mae': float(mae),
             'all_srcc': float(srcc),
@@ -464,6 +482,10 @@ def main():
     # ── Load config ───────────────────────────────────────────────────
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    args.output_dir = (args.output_dir
+                       or cfg.get('per_comp', {}).get('output_dir')
+                       or './best_pkl/per_comp')
 
     cif_dir    = cfg['cif_dir']
     csv_path   = cfg['csv_path']

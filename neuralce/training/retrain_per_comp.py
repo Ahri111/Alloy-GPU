@@ -43,6 +43,7 @@ import optax
 import pandas as pd
 from scipy.stats import spearmanr
 from pymatgen.core.structure import Structure
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
 from neuralce.models.NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
                                           LITE_MODELS)
@@ -102,13 +103,13 @@ def load_data(cif_dir, csv_path, spin_pkl_path, id_col, comp_regex, exclude_z=No
         if cif_id not in energy_map:
             continue
 
-        crystal = Structure.from_file(os.path.join(cif_dir, cif_file))
+        crystal = load_cif_safe(os.path.join(cif_dir, cif_file))
         spins = spin_map.get(cif_id, [0] * len(crystal))
         spins = np.array(spins, dtype=np.float32)
 
         if exclude_z:
             keep_idx = [i for i, site in enumerate(crystal)
-                        if site.specie.Z not in exclude_z]
+                        if get_specie_number(site.specie) not in exclude_z]
             crystal = Structure.from_sites([crystal[i] for i in keep_idx])
             spins = spins[keep_idx]
 
@@ -133,7 +134,7 @@ def build_graph_lite(struct, cutoff, n_shells, max_num_nbr, species_map,
 
     atom_fea = np.zeros((n_at, n_species), dtype=np.float32)
     for i, site in enumerate(crystal):
-        z = site.specie.Z
+        z = get_specie_number(site.specie)
         if z in species_map:
             atom_fea[i, species_map[z]] = 1.0
 

@@ -15,7 +15,7 @@ species_map:
   22: 0    # Ti
   26: 1    # Fe
   8:  2    # O
-  54: 3    # Vo (Xe dummy)
+  0: 3    # Vo (Xe dummy)
 
 # No species excluded — Sr stays as zero-vector nodes
 exclude_species: []

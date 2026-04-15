@@ -43,6 +43,7 @@ import jax.numpy as jnp
 from jax import random, lax, vmap
 
 from pymatgen.core.structure import Structure
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
 from neuralce.models.NeuralCE_jax import (create_neuralce, is_spin_model, is_sisj_model,
                                           LITE_MODELS)
@@ -170,12 +171,12 @@ def build_template_graph(cif_path):
     Edge features (distance-based shell one-hot) and neighbor indices
     are invariant → computed once and cached.
     """
-    crystal = Structure.from_file(cif_path)
+    crystal = load_cif_safe(cif_path)
 
     # Exclude species (e.g., Sr in STFO)
     if EXCLUDE_Z:
         keep_idx = [i for i, site in enumerate(crystal)
-                    if site.specie.Z not in EXCLUDE_Z]
+                    if get_specie_number(site.specie) not in EXCLUDE_Z]
         crystal = Structure.from_sites([crystal[i] for i in keep_idx])
 
     n_at = len(crystal)
@@ -209,7 +210,7 @@ def build_template_graph(cif_path):
     # Species assignment from template
     species_arr = np.zeros(n_at, dtype=np.int32)
     for i, site in enumerate(crystal):
-        z = site.specie.Z
+        z = get_specie_number(site.specie)
         if z in SPECIES_MAP:
             species_arr[i] = SPECIES_MAP[z]
 

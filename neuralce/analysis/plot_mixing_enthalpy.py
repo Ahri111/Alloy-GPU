@@ -48,11 +48,27 @@ def parse_args():
                    help="Don't display plot (for headless/batch)")
     p.add_argument("--figsize", type=str, default="8,5",
                    help="Figure size as 'w,h'. Default: 8,5")
+    p.add_argument("--e_ref_low", type=float, default=-1209.4888,
+                   help="Low-endpoint reference total energy (eV/supercell). "
+                        "Default: STO -1209.4888")
+    p.add_argument("--e_ref_high", type=float, default=-937.79694,
+                   help="High-endpoint reference total energy (eV/supercell). "
+                        "Default: SFO G-AFM -937.79694")
+    p.add_argument("--ref_n_atoms", type=int, default=160,
+                   help="Atom count used to per-atom normalize targets + "
+                        "reference. Default: 160 (STFO supercell)")
+    p.add_argument("--no_override", action="store_true",
+                   help="Ignore --e_ref_low/--e_ref_high and use in-data mean.")
     return p.parse_args()
 
 
-def load_checkpoint(path):
-    """Load retrain checkpoint and extract all splits."""
+def load_checkpoint(path, ref_n_atoms=160):
+    """Load retrain checkpoint and extract all splits.
+
+    ref_n_atoms: divisor for per-atom normalization. Default 160 (STFO supercell).
+                 Overrides ckpt['n_atoms_orig']. targets and reference must share
+                 the same divisor so ΔH_mix is on the correct scale.
+    """
     with open(path, 'rb') as f:
         ckpt = pickle.load(f)
 
@@ -73,28 +89,8 @@ def load_checkpoint(path):
                ['val']   * len(ckpt['targets_val']) +
                ['test']  * len(ckpt['targets_test']))
 
-    # Per-atom normalization
-    n_atoms_orig = ckpt.get('n_atoms_orig', None)
-    n_atoms_list = ckpt.get('n_atoms_list', None)
-
-    if n_atoms_list is not None and n_atoms_orig is None:
-        # Variable mode — per-structure atom counts
-        # n_atoms_list covers all structures in dataset order,
-        # but we need to reconstruct per-split ordering.
-        # Fall back to n_atoms_list if available as full array.
-        print("  Variable atom counts detected")
-        divisors = np.array(n_atoms_list, dtype=np.float64)
-        if len(divisors) == len(targets):
-            pass  # already aligned
-        else:
-            # Can't reliably reconstruct — use 1 (raw energies)
-            print("  ⚠ Cannot align n_atoms_list with splits. Using raw energies.")
-            divisors = np.ones(len(targets))
-    elif n_atoms_orig is not None:
-        divisors = np.full(len(targets), n_atoms_orig, dtype=np.float64)
-    else:
-        print("  ⚠ No atom count info in checkpoint. Using raw energies.")
-        divisors = np.ones(len(targets))
+    print(f"  Per-atom divisor (ref_n_atoms): {ref_n_atoms}")
+    divisors = np.full(len(targets), ref_n_atoms, dtype=np.float64)
 
     targets_pa = targets / divisors
     preds_pa   = preds / divisors
@@ -103,12 +99,21 @@ def load_checkpoint(path):
 
 
 def compute_mixing_enthalpy(targets_pa, preds_pa, comps, comp_scale,
-                            endpoint_comps=None):
-    """Compute mixing enthalpy relative to linear interpolation of endpoints.
+                            endpoint_comps=None,
+                            e_ref_low_override=None, e_ref_high_override=None,
+                            ref_n_atoms=160):
+    """Compute mixing enthalpy.
 
     ΔH_mix(x) = E_pa(x) - [(1-x)*E_ref_low + x*E_ref_high]
 
-    E_ref at endpoints = mean of DFT energies at that composition.
+    e_ref_{low,high}_override: external reference total energies (eV/supercell).
+        If given, divided by ref_n_atoms to get per-atom and used instead of
+        the in-data mean. Ideal for fixed STO/SFO end-members.
+    ref_n_atoms: divisor for the override energies (should match the divisor
+        used on targets_pa — default 160 for STFO).
+
+    If overrides are None → fall back to mean of data at endpoint comps.
+    x-axis: simple fraction `comps / comp_scale`.
     """
     unique_comps = sorted(set(comps))
 
@@ -116,37 +121,40 @@ def compute_mixing_enthalpy(targets_pa, preds_pa, comps, comp_scale,
         endpoint_comps = (min(unique_comps), max(unique_comps))
     c_low, c_high = endpoint_comps
 
-    # Reference energies: mean DFT per-atom energy at endpoints
     mask_low  = comps == c_low
     mask_high = comps == c_high
 
-    if not mask_low.any():
-        raise ValueError(f"No structures at endpoint comp_code={c_low}")
-    if not mask_high.any():
-        raise ValueError(f"No structures at endpoint comp_code={c_high}")
+    # Low endpoint reference
+    if e_ref_low_override is not None:
+        e_ref_low = e_ref_low_override / ref_n_atoms
+        print(f"  E_ref_low  (override): {e_ref_low_override:.4f} eV / {ref_n_atoms} = {e_ref_low:.6f} eV/atom")
+    else:
+        if not mask_low.any():
+            raise ValueError(f"No structures at endpoint comp_code={c_low}")
+        e_ref_low = np.mean(targets_pa[mask_low])
+        print(f"  E_ref_low  (data mean @ x={c_low/comp_scale:.4f}): "
+              f"{e_ref_low:.6f} eV/atom ({mask_low.sum()} structures)")
 
-    e_ref_low  = np.mean(targets_pa[mask_low])
-    e_ref_high = np.mean(targets_pa[mask_high])
+    # High endpoint reference
+    if e_ref_high_override is not None:
+        e_ref_high = e_ref_high_override / ref_n_atoms
+        print(f"  E_ref_high (override): {e_ref_high_override:.4f} eV / {ref_n_atoms} = {e_ref_high:.6f} eV/atom")
+    else:
+        if not mask_high.any():
+            raise ValueError(f"No structures at endpoint comp_code={c_high}")
+        e_ref_high = np.mean(targets_pa[mask_high])
+        print(f"  E_ref_high (data mean @ x={c_high/comp_scale:.4f}): "
+              f"{e_ref_high:.6f} eV/atom ({mask_high.sum()} structures)")
 
-    print(f"  Endpoint references (DFT per-atom):")
-    print(f"    x_low  = {c_low/comp_scale:.4f}: E_ref = {e_ref_low:.6f} eV/atom "
-          f"({mask_low.sum()} structures)")
-    print(f"    x_high = {c_high/comp_scale:.4f}: E_ref = {e_ref_high:.6f} eV/atom "
-          f"({mask_high.sum()} structures)")
+    # Fraction: simple comp/comp_scale
+    x = comps / comp_scale
 
-    # Fraction
-    x = (comps - c_low) / (c_high - c_low)
-
-    # Linear interpolation reference
+    # Linear interpolation reference (at x values of each structure)
     e_ref_interp = (1 - x) * e_ref_low + x * e_ref_high
 
-    # Mixing enthalpy
-    dh_dft  = targets_pa - e_ref_interp
-    dh_pred = preds_pa   - e_ref_interp
-
-    # Convert to meV/atom for readability
-    dh_dft  *= 1000
-    dh_pred *= 1000
+    # Mixing enthalpy (meV/atom for readability)
+    dh_dft  = (targets_pa - e_ref_interp) * 1000
+    dh_pred = (preds_pa   - e_ref_interp) * 1000
 
     return x, dh_dft, dh_pred
 
@@ -234,7 +242,8 @@ def main():
         matplotlib.use('Agg')
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    targets_pa, preds_pa, comps, splits, ckpt = load_checkpoint(args.checkpoint)
+    targets_pa, preds_pa, comps, splits, ckpt = load_checkpoint(
+        args.checkpoint, ref_n_atoms=args.ref_n_atoms)
     print(f"  Total structures: {len(targets_pa)}")
     print(f"  Unique compositions: {sorted(set(comps))}")
 
@@ -260,9 +269,13 @@ def main():
         endpoint_comps = None  # auto min/max
 
     # Compute mixing enthalpy
+    e_low  = None if args.no_override else args.e_ref_low
+    e_high = None if args.no_override else args.e_ref_high
     x, dh_dft, dh_pred = compute_mixing_enthalpy(
         targets_pa, preds_pa, comps, comp_scale,
-        endpoint_comps=endpoint_comps)
+        endpoint_comps=endpoint_comps,
+        e_ref_low_override=e_low, e_ref_high_override=e_high,
+        ref_n_atoms=args.ref_n_atoms)
 
     # Print per-composition summary
     print(f"\n  {'Comp':>8} {'x':>6} {'N':>5} {'DFT mean':>10} {'Pred mean':>10} {'Diff':>8}")

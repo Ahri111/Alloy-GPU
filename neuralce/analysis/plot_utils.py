@@ -34,31 +34,49 @@ def _load_ckpt(path):
 # 1. Mixing Enthalpy Parity Plot
 # ═══════════════════════════════════════════════════════════════════════
 
-def plot_parity_mixing_enthalpy(ckpt_path, save=None, figsize=(5, 5), dpi=200):
+def plot_parity_mixing_enthalpy(ckpt_path, save=None, figsize=(5, 5), dpi=200,
+                                e_ref_low=-1209.4888, e_ref_high=-937.79694,
+                                ref_n_atoms=160, comp_scale=None):
     """Mixing enthalpy parity plot from retrained checkpoint.
-    
+
     Args:
         ckpt_path: path to retrained .pkl
         save: save path (png/pdf). None = don't save
         figsize: figure size
         dpi: resolution
+        e_ref_low: low-endpoint reference total energy (eV/supercell).
+                   Default STO = -1209.4888. Pass None → use data mean.
+        e_ref_high: high-endpoint reference total energy (eV/supercell).
+                    Default SFO G-AFM = -937.79694. Pass None → use data mean.
+        ref_n_atoms: divisor for per-atom normalization. Default 160 (STFO).
+                     targets and reference share this divisor.
+        comp_scale: divisor for x-fraction. Default: comps.max() (e.g. 750 → 750/750=1).
+                    For STFO with override energies representing x=0 and x=1,
+                    pass 1000 to get x in [0.125, 0.750].
     Returns:
         fig, ax
     """
     ckpt = _load_ckpt(ckpt_path)
-    n_orig = ckpt['n_atoms_orig']
 
-    targets_pa = ckpt['targets_all'] / n_orig
-    preds_pa   = ckpt['preds_all']   / n_orig
+    targets_pa = ckpt['targets_all'] / ref_n_atoms
+    preds_pa   = ckpt['preds_all']   / ref_n_atoms
     comps      = ckpt['comps_all']
     splits     = ckpt['splits_all']  # 0=train, 1=val, 2=test
 
-    # Endpoint reference
-    comp_scale = comps.max()
+    # Endpoint reference (per-atom)
+    if e_ref_low is None:
+        e_ref_low_pa = np.mean(targets_pa[comps == comps.min()])
+    else:
+        e_ref_low_pa = e_ref_low / ref_n_atoms
+    if e_ref_high is None:
+        e_ref_high_pa = np.mean(targets_pa[comps == comps.max()])
+    else:
+        e_ref_high_pa = e_ref_high / ref_n_atoms
+
+    if comp_scale is None:
+        comp_scale = comps.max()
     x = comps / comp_scale
-    e_ref_low  = np.mean(targets_pa[comps == comps.min()])
-    e_ref_high = np.mean(targets_pa[comps == comps.max()])
-    e_interp   = (1 - x) * e_ref_low + x * e_ref_high
+    e_interp = (1 - x) * e_ref_low_pa + x * e_ref_high_pa
 
     dh_dft  = (targets_pa - e_interp) * 1000  # meV/atom
     dh_pred = (preds_pa   - e_interp) * 1000

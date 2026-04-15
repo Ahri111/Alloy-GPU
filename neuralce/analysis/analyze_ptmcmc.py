@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from pymatgen.core.structure import Structure
 from pymatgen.core import DummySpecies, Element
+from neuralce.utils.cif_utils import load_cif_safe, get_specie_number
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -140,9 +141,9 @@ kB = 8.617333262145e-5
 # ═══════════════════════════════════════════════════════════════════════
 # 2. TEMPLATE
 # ═══════════════════════════════════════════════════════════════════════
-template_full = Structure.from_file(args.template)
+template_full = load_cif_safe(args.template)
 if exclude_z:
-    keep = [i for i, s in enumerate(template_full) if s.specie.Z not in exclude_z]
+    keep = [i for i, s in enumerate(template_full) if get_specie_number(s.specie) not in exclude_z]
     template = Structure.from_sites([template_full[i] for i in keep])
 else:
     template = template_full

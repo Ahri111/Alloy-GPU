@@ -1,0 +1,37 @@
+mode: ablation
+dataset_name: nipt
+cif_dir: ./data/processed/nipt
+csv_path: ./data/processed/nipt/detailed_info.csv
+spin_pkl: null
+id_col: id
+comp_regex: Pt(\d+)_
+species_map:
+  28: 0
+  78: 1
+n_atoms: 108
+has_spin: false
+ablation:
+  output_dir: ./best_pkl/nipt_3shell
+  seed: 42
+  val_frac: 0.15
+  test_frac: 0.15
+  max_epochs: 2000
+  patience: 100
+  batch_size: 32
+  n_trials: 30
+  search_space:
+    atom_fea_len: [2,3,4,5,6,7,8]
+    n_conv: [3,4,5]
+    h_fea_len: [16, 20, 24, 28, 32]
+    lr: [1.0e-4, 5.0e-3]
+  run_models:
+  - ising_lite
+graph:
+  cutoff: 4.88
+  n_shells: 3
+  shell_edges:
+  - 0.0
+  - 3.365
+  - 4.385
+  - 4.88
+  max_num_nbr: 42

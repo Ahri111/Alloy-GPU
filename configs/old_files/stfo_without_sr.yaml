@@ -11,7 +11,7 @@ species_map:
   22: 0
   26: 1
   8: 2
-  54: 3
+  0: 3
 exclude_species:
 - 38
 graph:
