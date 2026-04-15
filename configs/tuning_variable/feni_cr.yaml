@@ -3,13 +3,15 @@ dataset_name: feni_cr
 cif_dir: ./data/processed/feni_cr
 csv_path: ./data/processed/feni_cr/detailed_info.csv
 id_col: id
-comp_regex: Fe(\d+)
-n_atoms: 108
+comp_regex: 'Fe(\d+)'      # 작은 셀에선 매칭 안 됨 → 0으로 떨어짐 (per-comp 분석은 의미 약함)
+
+n_atoms: 108               # max 셀 크기 (padding target)
+n_atoms_orig: 108
 has_spin: true
 species_map:
-  26: 0    # Fe
-  28: 1    # Ni
-  24: 2    # Cr
+  26: 0   # Fe
+  28: 1   # Ni
+  24: 2   # Cr
 exclude_species: []
 
 graph:
@@ -20,7 +22,7 @@ graph:
       shell_edges: [0.0, 3.075, 3.65]
 
 ablation:
-  output_dir: ./best_pkl/feni_cr
+  output_dir: ./best_pkl/feni_cr_variable
   seed: 42
   val_frac: 0.15
   test_frac: 0.15
@@ -30,10 +32,10 @@ ablation:
   n_trials: 200
   optuna_timeout: null
   search_space:
-    atom_fea_len: [8, 9, 10, 11, 12, 13, 14, 15, 16]
-    n_conv: [1, 2, 3]
-    h_fea_len: [16, 20, 24, 28, 32]
-    lr: [0.0001, 0.005]
-    odd_fea_len: [2, 4, 8]
+    hidden_dim: [8, 12, 16, 20, 24, 28, 32]
+    n_conv: [2, 3]
+    lr: [1.0e-4, 5.0e-3]
+    odd_fea_len: [1, 2, 4]
   run_models:
-  - hegnn_lite
+    - neuralce_evenodd_lite
+    - neuralce_sisj_lite
